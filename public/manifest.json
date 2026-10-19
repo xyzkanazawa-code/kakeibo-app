@@ -1,0 +1,17 @@
+{
+  "name": "超圧縮Drive家計簿",
+  "short_name": "家計簿ログ",
+  "description": "超圧縮Driveバックアップ＆底値帳・購入ログ対応 個人用家計簿",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
