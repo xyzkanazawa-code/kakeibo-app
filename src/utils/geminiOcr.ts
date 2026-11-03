@@ -108,23 +108,33 @@ export function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
-// 優先的に試すFlashモデル候補
-const CANDIDATE_MODELS = [
+// 優先的に試すFlash・Liteモデル候補（混雑に強い軽量モデル含む）
+export const CANDIDATE_MODELS = [
   'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.5-flash',
   'gemini-2.5-flash',
+  'gemini-2.5-pro',
   'gemini-2.0-flash',
-  'gemini-1.5-flash'
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-8b'
 ];
 
 let cachedActiveModel: string | null = null;
+let cachedModelQueue: string[] | null = null;
 
 /**
- * APIキーで利用可能な最新のGemini Flashモデルを動的に探索・特定する
+ * APIキーで利用可能なGeminiモデルの優先順リストを動的に取得する
  */
-export async function resolveAvailableGeminiModel(apiKey: string, forceRefresh = false): Promise<string> {
-  const trimmed = apiKey.trim();
-  if (cachedActiveModel && !forceRefresh) {
-    return cachedActiveModel;
+export async function resolveCandidateModels(apiKey: string, forceRefresh = false): Promise<string[]> {
+  const trimmed = apiKey?.trim();
+  if (!trimmed) return CANDIDATE_MODELS;
+
+  if (cachedModelQueue && cachedModelQueue.length > 0 && !forceRefresh) {
+    if (cachedActiveModel) {
+      return [cachedActiveModel, ...cachedModelQueue.filter(m => m !== cachedActiveModel)];
+    }
+    return cachedModelQueue;
   }
 
   try {
@@ -133,42 +143,62 @@ export async function resolveAvailableGeminiModel(apiKey: string, forceRefresh =
     if (res.ok) {
       const data = await res.json();
       const models: any[] = data.models || [];
-      const supported = models
+      const supported: string[] = models
         .filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
         .map(m => m.name.replace(/^models\//, ''));
 
-      // 1. 候補順に利用可能なものを探索
+      // 候補リストにあるものを優先して並べる
+      const prioritized: string[] = [];
       for (const cand of CANDIDATE_MODELS) {
-        if (supported.includes(cand)) {
-          cachedActiveModel = cand;
-          return cand;
+        if (supported.includes(cand) && !prioritized.includes(cand)) {
+          prioritized.push(cand);
         }
       }
 
-      // 2. 名前に "flash" を含むモデルを探索
-      const flashModel = supported.find(m => m.toLowerCase().includes('flash'));
-      if (flashModel) {
-        cachedActiveModel = flashModel;
-        return flashModel;
+      // Flash または Lite 系モデルで未追加のものを追加
+      for (const m of supported) {
+        const lower = m.toLowerCase();
+        if ((lower.includes('flash') || lower.includes('lite')) && !prioritized.includes(m)) {
+          prioritized.push(m);
+        }
       }
 
-      // 3. 最初に見つかったモデル
-      if (supported.length > 0) {
-        cachedActiveModel = supported[0];
-        return supported[0];
+      // その他の generateContent 対応モデルを追加
+      for (const m of supported) {
+        if (!prioritized.includes(m)) {
+          prioritized.push(m);
+        }
+      }
+
+      if (prioritized.length > 0) {
+        cachedModelQueue = prioritized;
+        if (cachedActiveModel && prioritized.includes(cachedActiveModel)) {
+          return [cachedActiveModel, ...prioritized.filter(m => m !== cachedActiveModel)];
+        }
+        return prioritized;
       }
     }
   } catch (err) {
-    console.warn('ListModels自動取得スキップ:', err);
+    console.warn('利用可能モデル一覧の動的取得スキップ:', err);
   }
 
-  // デフォルト候補（2026年最新）
-  cachedActiveModel = 'gemini-3.8-flash';
-  return cachedActiveModel;
+  cachedModelQueue = CANDIDATE_MODELS;
+  if (cachedActiveModel) {
+    return [cachedActiveModel, ...CANDIDATE_MODELS.filter(m => m !== cachedActiveModel)];
+  }
+  return CANDIDATE_MODELS;
 }
 
 /**
- * Gemini APIキーの疎通確認・検証テスト（利用可能モデルを自動特定してテスト）
+ * 利用可能な最新Geminiモデルを1つ取得
+ */
+export async function resolveAvailableGeminiModel(apiKey: string, forceRefresh = false): Promise<string> {
+  const models = await resolveCandidateModels(apiKey, forceRefresh);
+  return models[0] || 'gemini-3.8-flash';
+}
+
+/**
+ * Gemini APIキーの疎通確認・検証テスト（503混雑時も別モデルへ自動フォールバックして稼働中モデルを特定）
  */
 export async function testGeminiApiKey(apiKey: string): Promise<{ success: boolean; message: string; model?: string }> {
   const trimmed = apiKey?.trim();
@@ -176,10 +206,10 @@ export async function testGeminiApiKey(apiKey: string): Promise<{ success: boole
     return { success: false, message: 'APIキーが入力されていません。' };
   }
 
-  const modelToTest = await resolveAvailableGeminiModel(trimmed, true);
-
-  // 試行するモデル順（自動解決モデル -> 他の候補）
-  const testQueue = [modelToTest, ...CANDIDATE_MODELS.filter(m => m !== modelToTest)];
+  const testQueue = await resolveCandidateModels(trimmed, true);
+  const attemptedNotes: string[] = [];
+  let saw503 = false;
+  let saw429 = false;
 
   for (const model of testQueue) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(trimmed)}`;
@@ -195,9 +225,12 @@ export async function testGeminiApiKey(apiKey: string): Promise<{ success: boole
 
       if (res.ok) {
         cachedActiveModel = model;
+        const note = attemptedNotes.length > 0
+          ? `接続成功！モデル「${model}」が稼働しています（一部混雑モデルから自動フェイルオーバーしました）。`
+          : `接続成功！モデル「${model}」が正常に稼働しています。`;
         return {
           success: true,
-          message: `接続成功！モデル「${model}」が正常に稼働しています。`,
+          message: note,
           model
         };
       }
@@ -210,7 +243,7 @@ export async function testGeminiApiKey(apiKey: string): Promise<{ success: boole
         detail = await res.text();
       }
 
-      // 404の場合は次のモデル候補を試す
+      // 404（非対応・終了モデル）の場合は次のモデルへ
       if (res.status === 404) {
         continue;
       }
@@ -221,13 +254,42 @@ export async function testGeminiApiKey(apiKey: string): Promise<{ success: boole
       if (res.status === 403) {
         return { success: false, message: `権限エラー (403): ${detail}` };
       }
-      return { success: false, message: `API接続エラー (${res.status}): ${detail}` };
+
+      // 503（サーバー混雑・過負荷）または 5xx / 429 の場合は記録して次のモデル候補へ進む！
+      if (res.status === 503 || /high demand|overloaded|unavailable/i.test(detail)) {
+        saw503 = true;
+        attemptedNotes.push(`${model} (503混雑)`);
+        continue;
+      }
+      if (res.status === 429 || /quota/i.test(detail)) {
+        saw429 = true;
+        attemptedNotes.push(`${model} (429制限)`);
+        continue;
+      }
+
+      attemptedNotes.push(`${model} (${res.status})`);
     } catch (e: any) {
-      return { success: false, message: `ネットワーク接続エラー: ${e?.message || '通信できませんでした'}` };
+      attemptedNotes.push(`${model} (通信不可)`);
     }
   }
 
-  return { success: false, message: '利用可能なGeminiモデルが見つかりませんでした。Google AI Studioで有効なモデルをご確認ください。' };
+  if (saw503) {
+    return {
+      success: false,
+      message: `Googleサーバーが高負荷・混雑 (503) しています。（試行: ${attemptedNotes.join(', ')}）。少し時間を置いて再試行してください。`
+    };
+  }
+  if (saw429) {
+    return {
+      success: false,
+      message: `APIキーの利用回数制限 (429 Too Many Requests) に達しています。無料枠の1日の上限に達した可能性があるため、Google AI Studioをご確認いただくか、新しいAPIキーをお試しください。`
+    };
+  }
+
+  return {
+    success: false,
+    message: `利用可能なGeminiモデルが見つかりませんでした。（試行: ${attemptedNotes.join(', ') || 'なし'}）`
+  };
 }
 
 /** Gemini APIエラーの種類（UIでAPIキー入力を出すかどうかの判定に使用） */
@@ -256,14 +318,14 @@ const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
 /**
  * 汎用: 画像＋プロンプト＋JSONスキーマでGeminiを呼び出し、JSON文字列を返す
- * - 混雑(503)・回数制限(429)・一時障害(5xx)は待機して再試行
- * - それでも失敗したら別のFlashモデルに自動で切り替え
+ * - 混雑(503)・回数制限(429)・一時障害(5xx)が発生した場合、即座に安定稼働モデルへ自動フェイルオーバー
  */
 export async function callGeminiVisionJson(
   imageDataUrl: string,
   apiKey: string,
   prompt: string,
-  responseSchema: Record<string, unknown>
+  responseSchema: Record<string, unknown>,
+  onStatusUpdate?: (statusText: string) => void
 ): Promise<string> {
   if (!apiKey || !apiKey.trim()) {
     throw new GeminiApiError('key', 'Gemini APIキーが設定されていません。設定画面からAPIキーを入力してください。');
@@ -278,35 +340,39 @@ export async function callGeminiVisionJson(
     }
   });
 
-  const activeModel = await resolveAvailableGeminiModel(apiKey);
-  const modelsToTry = [activeModel, ...CANDIDATE_MODELS.filter(m => m !== activeModel)];
-  let sawBusy = false;
+  const modelsToTry = await resolveCandidateModels(apiKey);
+  let saw503 = false;
+  let saw429 = false;
   let sawNetwork = false;
   let lastDetail = '';
 
-  for (const model of modelsToTry) {
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const model = modelsToTry[mIdx];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
 
-    // 同じモデルで最大3回（初回＋再試行2回）
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // 各モデル最大2回試行（初回＋高速リトライ1回）
+    for (let attempt = 0; attempt < 2; attempt++) {
       let res: Response;
       try {
         res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
       } catch (err: any) {
         sawNetwork = true;
         lastDetail = err?.message || '';
-        if (attempt < 2) { await sleep(1200 * (attempt + 1)); continue; }
+        if (attempt === 0) {
+          await sleep(1000);
+          continue;
+        }
         break;
       }
 
-      if (res.status === 404) break; // このモデルは使えない → 次のモデルへ
+      if (res.status === 404) break; // このモデルは非対応/終了 → 次のモデルへ
 
       if (res.ok) {
         const data = await res.json();
         const textOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!textOutput) {
           lastDetail = '応答が空でした';
-          if (attempt < 2) { await sleep(800); continue; }
+          if (attempt === 0) { await sleep(800); continue; }
           break;
         }
         cachedActiveModel = model;
@@ -329,21 +395,48 @@ export async function callGeminiVisionJson(
         throw new GeminiApiError('key', `APIキーに権限がありません (${res.status})。設定画面でAPIキーをご確認ください。`);
       }
 
-      if (RETRYABLE.has(res.status)) {
-        sawBusy = true;
-        if (attempt < 2) {
-          await sleep(1500 * Math.pow(2, attempt)); // 1.5秒 → 3秒
+      // 503 または 429 などの一時過負荷
+      if (res.status === 503 || /high demand|overloaded/i.test(errorDetail)) {
+        saw503 = true;
+        if (attempt === 0) {
+          await sleep(1000); // 1秒だけ高速リトライ
           continue;
         }
-        break; // このモデルは混雑中 → 次のモデルへ
+        // それでも503なら即座に次のモデル候補へフェイルオーバー！
+        const nextModel = modelsToTry[mIdx + 1];
+        if (nextModel) {
+          onStatusUpdate?.(`モデル混雑(503)のため、別モデル（${nextModel}）へ自動切替中...`);
+        }
+        break;
+      }
+
+      if (res.status === 429 || /quota/i.test(errorDetail)) {
+        saw429 = true;
+        const nextModel = modelsToTry[mIdx + 1];
+        if (nextModel) {
+          onStatusUpdate?.(`モデル制限(429)のため、別モデル（${nextModel}）へ自動切替中...`);
+        }
+        break; // モデル切り替えを試す
+      }
+
+      if (RETRYABLE.has(res.status)) {
+        saw503 = true;
+        if (attempt === 0) {
+          await sleep(1200);
+          continue;
+        }
+        break;
       }
 
       throw new GeminiApiError('other', `Gemini APIエラー (${res.status}): ${errorDetail}`);
     }
   }
 
-  if (sawBusy) {
-    throw new GeminiApiError('busy', 'Googleのサーバーが混雑しています（APIキーは正常です）。少し時間をおいて「再試行」を押してください。');
+  if (saw503) {
+    throw new GeminiApiError('busy', 'Googleのサーバーが高負荷・混雑（503）しています。全モデルで自動切替を試みましたが応答がありませんでした。少し時間をおいて「再試行」を押してください。');
+  }
+  if (saw429) {
+    throw new GeminiApiError('busy', 'APIキーの利用回数制限（429）に達しました。無料枠の1日の上限に達した可能性があるため、時間をおくか新しいAPIキーをお試しください。');
   }
   if (sawNetwork) {
     throw new GeminiApiError('network', `通信できませんでした。電波状況を確認して再試行してください。（${lastDetail}）`);
@@ -352,11 +445,12 @@ export async function callGeminiVisionJson(
 }
 
 /**
- * レシート画像をGeminiで高精度解析する（動的モデル対応）
+ * レシート画像をGeminiで高精度解析する（動的モデル対応 & 自動フェイルオーバー）
  */
 export async function analyzeReceiptWithGemini(
   imageDataUrl: string,
-  apiKey: string
+  apiKey: string,
+  onStatusUpdate?: (statusText: string) => void
 ): Promise<GeminiReceiptResult> {
   if (!apiKey || !apiKey.trim()) {
     throw new Error('Gemini APIキーが設定されていません。設定画面からAPIキーを入力してください。');
@@ -436,7 +530,7 @@ export async function analyzeReceiptWithGemini(
   };
 
   // 混雑時の再試行・別モデルへの自動切替は callGeminiVisionJson が担当
-  const textOutput = await callGeminiVisionJson(imageDataUrl, apiKey, prompt, requestBody.generationConfig.response_schema);
+  const textOutput = await callGeminiVisionJson(imageDataUrl, apiKey, prompt, requestBody.generationConfig.response_schema, onStatusUpdate);
 
   try {
     const parsed = JSON.parse(textOutput);

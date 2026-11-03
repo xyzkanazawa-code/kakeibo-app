@@ -147,7 +147,9 @@ export function ScannerModal({ isOpen, onClose, onOpenSettings }: ScannerModalPr
       setOcrPercent(60);
       setOcrStatusText('Gemini AI が購入日・店名・品目・合計を高精度解析中...');
 
-      const result = await analyzeReceiptWithGemini(imageUrl, apiKey);
+      const result = await analyzeReceiptWithGemini(imageUrl, apiKey, (msg) => {
+        setOcrStatusText(msg);
+      });
       setOcrPercent(100);
       setGeminiResult(result);
       setGeminiError(null);
@@ -855,7 +857,9 @@ export function ScannerModal({ isOpen, onClose, onOpenSettings }: ScannerModalPr
                     <AlertTriangle size={16} className="text-amber-600 shrink-0 mt-0.5" />
                     <div className="space-y-1">
                       <span className="font-bold block">
-                        {geminiErrorKind === 'busy' ? 'Google サーバー一時混雑 (503)' : 'Gemini AI 解析のご案内'}
+                        {geminiErrorKind === 'busy'
+                          ? (geminiError.includes('429') ? 'Gemini API 利用制限 (429)' : 'Google サーバー一時混雑 (503)')
+                          : 'Gemini AI 解析のご案内'}
                       </span>
                       <p className="text-[11px] text-amber-800 leading-relaxed">{geminiError}</p>
                     </div>
